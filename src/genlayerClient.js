@@ -2,7 +2,7 @@ import { createClient } from 'genlayer-js'
 import { testnetBradbury } from 'genlayer-js/chains'  // ← было testnetAsimov!
 import { custom } from 'viem'
 
-export const CONTRACT_ADDRESS = '0x30d00D02ED527cf4a5d227887F7f62Eb3d580bF6'
+export const CONTRACT_ADDRESS = '0x4519C9bD634ee441562055Ed0702Da6918668FDc'
 
 export const explorerTxUrl = (hash) =>
   `https://explorer-bradbury.genlayer.com/tx/${hash}`
