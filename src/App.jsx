@@ -189,12 +189,11 @@ function CreateDealCard({ disabled, pending, onRun }) {
 
   const submit = (e) => {
     e.preventDefault()
-    const amountWei = BigInt(Math.round(Number(amount) * 1e18))
     onRun('create_deal', 'Create deal', (client) =>
       writeAndWait(client, {
         functionName: 'create_deal',
-        args: [freelancer.trim(), description.trim()],
-        value: amountWei,
+        args: [freelancer.trim(), description.trim(), Number(amount)],
+        value: 0n,
       }),
     )
     setFreelancer('')
