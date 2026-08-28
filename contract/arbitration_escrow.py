@@ -10,15 +10,14 @@ DISPUTE_CANCEL_DELAY_BLOCKS = 50_000
 
 class ArbitrationEscrow(gl.Contract):
     """
-    AI Arbitration Escrow — payable edition.
+    AI Arbitration Escrow — v3.
 
-    Assets are deposited by the client on deal creation and held by
-    the contract. On resolution the full deposit is transferred to
-    the winner; on a voluntary release it is transferred to the
-    freelancer. A stalled dispute (freelancer never submits evidence)
-    can only be cancelled by the client after DISPUTE_CANCEL_DELAY_BLOCKS
-    blocks have elapsed, ensuring a genuine time-lock rather than an
-    instant escape hatch.
+    Amount is recorded on deal creation. On resolution the full amount
+    is transferred to the winner via gl.transfer; on a voluntary release
+    it is transferred to the freelancer. A stalled dispute (freelancer
+    never submits evidence) can only be cancelled by the client after
+    DISPUTE_CANCEL_DELAY_BLOCKS blocks have elapsed, ensuring a genuine
+    time-lock rather than an instant escape hatch.
 
     Deal lifecycle:
         FUNDED
@@ -37,12 +36,11 @@ class ArbitrationEscrow(gl.Contract):
         pass
 
     @gl.public.write
-    def create_deal(self, freelancer: str, description: str) -> None:
-        """Open a new escrow deal. Send the agreed amount as msg.value."""
+    def create_deal(self, freelancer: str, description: str, amount: int) -> None:
+        """Open a new escrow deal with the agreed amount."""
         assert len(freelancer) > 0, "Freelancer address cannot be empty"
         assert len(description) > 0, "Description cannot be empty"
-        amount = gl.message.value
-        assert amount > 0, "Must send a non-zero deposit to create a deal"
+        assert amount > 0, "Amount must be greater than zero"
         deal = {
             "id": len(self.deals),
             "client": str(gl.message.sender_address),
@@ -162,8 +160,7 @@ Return ONLY valid JSON in exactly this structure:
         """
         Bounded escape from the DISPUTED state with enforced block delay.
         The client may cancel only after DISPUTE_CANCEL_DELAY_BLOCKS blocks
-        have elapsed since the dispute was opened, giving the freelancer
-        real time to respond.
+        have elapsed since the dispute was opened.
         """
         deal = json.loads(self.deals[deal_id])
         assert deal["status"] == "DISPUTED", "Deal is not under dispute"
