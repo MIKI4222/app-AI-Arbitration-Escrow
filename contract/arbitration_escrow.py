@@ -13,7 +13,7 @@ class ArbitrationEscrow(gl.Contract):
     AI Arbitration Escrow — v3.
 
     Amount is recorded on deal creation. On resolution the full amount
-    is transferred to the winner via gl.transfer; on a voluntary release
+    is transferred to the winner via emit_transfer; on a voluntary release
     it is transferred to the freelancer. A stalled dispute (freelancer
     never submits evidence) can only be cancelled by the client after
     DISPUTE_CANCEL_DELAY_BLOCKS blocks have elapsed, ensuring a genuine
@@ -35,12 +35,14 @@ class ArbitrationEscrow(gl.Contract):
     def __init__(self):
         pass
 
-    @gl.public.write
+    @gl.public.write.payable
     def create_deal(self, freelancer: str, description: str, amount: int) -> None:
-        """Open a new escrow deal with the agreed amount."""
+        """Open a new escrow deal and deposit the agreed amount into custody."""
         assert len(freelancer) > 0, "Freelancer address cannot be empty"
         assert len(description) > 0, "Description cannot be empty"
         assert amount > 0, "Amount must be greater than zero"
+        assert gl.message.value == amount, \
+            "Sent value must exactly match the stated deal amount"
         deal = {
             "id": len(self.deals),
             "client": str(gl.message.sender_address),
@@ -57,6 +59,10 @@ class ArbitrationEscrow(gl.Contract):
         }
         self.deals.append(json.dumps(deal, sort_keys=True))
 
+    def _payout(self, recipient: str, amount: int) -> None:
+        """Send custodied GEN to a deal participant via the SDK transfer primitive."""
+        gl.ContractAt(Address(recipient)).emit_transfer(value=amount)
+
     @gl.public.write
     def release_funds(self, deal_id: int) -> None:
         """Client voluntarily releases the deposit to the freelancer."""
@@ -66,7 +72,7 @@ class ArbitrationEscrow(gl.Contract):
             "Only the client can release funds without a dispute"
         deal["status"] = "RELEASED_TO_FREELANCER"
         self.deals[deal_id] = json.dumps(deal, sort_keys=True)
-        gl.transfer(deal["freelancer"], deal["amount"])
+        self._payout(deal["freelancer"], deal["amount"])
 
     @gl.public.write
     def submit_client_evidence(self, deal_id: int, evidence_url: str, claim: str) -> None:
@@ -153,7 +159,7 @@ Return ONLY valid JSON in exactly this structure:
         deal["resolution_reasoning"] = parsed_result.get("reasoning", "")
         self.deals[deal_id] = json.dumps(deal, sort_keys=True)
         recipient = deal["freelancer"] if winner == "freelancer" else deal["client"]
-        gl.transfer(recipient, deal["amount"])
+        self._payout(recipient, deal["amount"])
 
     @gl.public.write
     def cancel_stalled_dispute(self, deal_id: int) -> None:
@@ -180,7 +186,7 @@ Return ONLY valid JSON in exactly this structure:
             "Deal resolved in favour of the client by default."
         )
         self.deals[deal_id] = json.dumps(deal, sort_keys=True)
-        gl.transfer(deal["client"], deal["amount"])
+        self._payout(deal["client"], deal["amount"])
 
     @gl.public.view
     def get_deal(self, deal_id: int) -> str:
