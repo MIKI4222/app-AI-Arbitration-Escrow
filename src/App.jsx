@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { parseEther } from 'viem'
 import {
   CONTRACT_ADDRESS,
   connectWallet,
@@ -189,11 +190,15 @@ function CreateDealCard({ disabled, pending, onRun }) {
 
   const submit = (e) => {
     e.preventDefault()
+    // amount is entered in GEN; convert to wei once and use the exact same
+    // value both as the deposit sent with the transaction and as the
+    // on-chain "amount" the contract records/verifies against it.
+    const amountWei = parseEther(amount)
     onRun('create_deal', 'Create deal', (client) =>
       writeAndWait(client, {
         functionName: 'create_deal',
-        args: [freelancer.trim(), description.trim(), Number(amount)],
-        value: 0n,
+        args: [freelancer.trim(), description.trim(), amountWei],
+        value: amountWei,
       }),
     )
     setFreelancer('')
