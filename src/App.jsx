@@ -10,6 +10,7 @@ import {
   makeClient,
   makeReadClient,
   shortenAddress,
+  waitForDealStatus,
   writeAndWait,
 } from './genlayerClient'
 import './App.css'
@@ -66,7 +67,7 @@ function App() {
   }, [updateStatus])
 
   const runWrite = useCallback(
-    async (key, label, fn) => {
+    async (key, label, fn, { dealId, expectedStatuses } = {}) => {
       if (!clientRef.current) {
         updateStatus('error', 'Connect a wallet first.')
         return
@@ -77,8 +78,16 @@ function App() {
       try {
         const hash = await fn(clientRef.current)
         setLastTx(hash)
-        updateStatus('success', `${label} succeeded.`)
+        // writeAndWait already waits for the transaction to be ACCEPTED, but
+        // that only confirms execution didn't revert — it doesn't confirm
+        // the deal actually reached the status we expect. Poll the real
+        // contract state before telling the user it succeeded.
+        if (dealId != null && expectedStatuses) {
+          updateStatus('pending', `${label} — confirming on-chain state...`)
+          await waitForDealStatus(makeReadClient(), dealId, expectedStatuses)
+        }
         await refreshDeals(true)
+        updateStatus('success', `${label} succeeded — contract state confirmed.`)
       } catch (e) {
         updateStatus('error', `${label} failed: ${humanError(e)}`)
       } finally {
@@ -99,7 +108,12 @@ function App() {
       />
 
       <div className="grid-two section">
-        <CreateDealCard disabled={!account} pending={pendingAction === 'create_deal'} onRun={runWrite} />
+        <CreateDealCard
+          disabled={!account}
+          pending={pendingAction === 'create_deal'}
+          onRun={runWrite}
+          nextDealId={totalDeals}
+        />
         <SubmitEvidenceCard disabled={!account} pending={pendingAction === 'submit_evidence'} onRun={runWrite} />
       </div>
 
@@ -176,7 +190,7 @@ function StatusBar({ status, pendingAction, lastTx }) {
   )
 }
 
-function CreateDealCard({ disabled, pending, onRun }) {
+function CreateDealCard({ disabled, pending, onRun, nextDealId }) {
   const [freelancer, setFreelancer] = useState('')
   const [description, setDescription] = useState('')
   const [amount, setAmount] = useState('')
@@ -194,12 +208,16 @@ function CreateDealCard({ disabled, pending, onRun }) {
     // value both as the deposit sent with the transaction and as the
     // on-chain "amount" the contract records/verifies against it.
     const amountWei = parseEther(amount)
-    onRun('create_deal', 'Create deal', (client) =>
-      writeAndWait(client, {
-        functionName: 'create_deal',
-        args: [freelancer.trim(), description.trim(), amountWei],
-        value: amountWei,
-      }),
+    onRun(
+      'create_deal',
+      'Create deal',
+      (client) =>
+        writeAndWait(client, {
+          functionName: 'create_deal',
+          args: [freelancer.trim(), description.trim(), amountWei],
+          value: amountWei,
+        }),
+      { dealId: nextDealId, expectedStatuses: ['FUNDED'] },
     )
     setFreelancer('')
     setDescription('')
@@ -272,12 +290,19 @@ function SubmitEvidenceCard({ disabled, pending, onRun }) {
     e.preventDefault()
     const fnName = role === 'client' ? 'submit_client_evidence' : 'submit_freelancer_evidence'
     const label = role === 'client' ? 'Submit client evidence' : 'Submit freelancer evidence'
-    onRun('submit_evidence', label, (client) =>
-      writeAndWait(client, {
-        functionName: fnName,
-        args: [Number(dealId), evidenceUrl.trim(), claim.trim()],
-        value: 0n,
-      }),
+    // Client evidence moves the deal to DISPUTED; freelancer evidence keeps
+    // it DISPUTED (but now with both sides in) — either way DISPUTED is the
+    // confirmed state we're waiting to observe.
+    onRun(
+      'submit_evidence',
+      label,
+      (client) =>
+        writeAndWait(client, {
+          functionName: fnName,
+          args: [Number(dealId), evidenceUrl.trim(), claim.trim()],
+          value: 0n,
+        }),
+      { dealId: Number(dealId), expectedStatuses: ['DISPUTED'] },
     )
     setEvidenceUrl('')
     setClaim('')
@@ -407,6 +432,9 @@ function DealCard({ deal, account, pendingAction, onRun }) {
     isDisputed && deal.freelancer_evidence_url && deal.freelancer_evidence_url.trim() !== ''
   const resolving = pendingAction === `resolve_${deal.id}`
   const releasing = pendingAction === `release_${deal.id}`
+  const cancellingStalled = pendingAction === `cancel_stalled_${deal.id}`
+  const recoveringArbitration = pendingAction === `recover_arb_${deal.id}`
+  const disputedNoFreelancerEvidence = isDisputed && !freelancerEvidenceSubmitted
 
   return (
     <article className="deal-card">
@@ -475,19 +503,23 @@ function DealCard({ deal, account, pendingAction, onRun }) {
         </div>
       )}
 
-      {(isFunded || freelancerEvidenceSubmitted) && account && (
+      {(isFunded || isDisputed) && account && (
         <div className="deal-actions">
           {isFunded && (
             <button
               className="btn btn-sm"
               disabled={releasing}
               onClick={() =>
-                onRun(`release_${deal.id}`, 'Release funds', (client) =>
-                  writeAndWait(client, {
-                    functionName: 'release_funds',
-                    args: [Number(deal.id)],
-                    value: 0n,
-                  }),
+                onRun(
+                  `release_${deal.id}`,
+                  'Release funds',
+                  (client) =>
+                    writeAndWait(client, {
+                      functionName: 'release_funds',
+                      args: [Number(deal.id)],
+                      value: 0n,
+                    }),
+                  { dealId: deal.id, expectedStatuses: ['RELEASED_TO_FREELANCER'] },
                 )
               }
             >
@@ -499,16 +531,75 @@ function DealCard({ deal, account, pendingAction, onRun }) {
               className="btn btn-sm btn-danger"
               disabled={resolving}
               onClick={() =>
-                onRun(`resolve_${deal.id}`, 'Resolve dispute (AI arbitration)', (client) =>
-                  writeAndWait(client, {
-                    functionName: 'resolve_dispute',
-                    args: [Number(deal.id)],
-                    value: 0n,
-                  }),
+                onRun(
+                  `resolve_${deal.id}`,
+                  'Resolve dispute (AI arbitration)',
+                  (client) =>
+                    writeAndWait(client, {
+                      functionName: 'resolve_dispute',
+                      args: [Number(deal.id)],
+                      value: 0n,
+                    }),
+                  {
+                    dealId: deal.id,
+                    expectedStatuses: ['RESOLVED_FOR_CLIENT', 'RESOLVED_FOR_FREELANCER'],
+                  },
                 )
               }
             >
               {resolving ? <><span className="spinner" /> Resolving...</> : 'Resolve dispute'}
+            </button>
+          )}
+          {disputedNoFreelancerEvidence && (
+            <button
+              className="btn btn-sm btn-secondary"
+              disabled={cancellingStalled}
+              title={`Only callable by the client once ${'50 000'} blocks have passed since the dispute was opened and the freelancer never responded.`}
+              onClick={() =>
+                onRun(
+                  `cancel_stalled_${deal.id}`,
+                  'Cancel stalled dispute',
+                  (client) =>
+                    writeAndWait(client, {
+                      functionName: 'cancel_stalled_dispute',
+                      args: [Number(deal.id)],
+                      value: 0n,
+                    }),
+                  { dealId: deal.id, expectedStatuses: ['RESOLVED_FOR_CLIENT'] },
+                )
+              }
+            >
+              {cancellingStalled ? (
+                <><span className="spinner" /> Cancelling...</>
+              ) : (
+                'Cancel stalled dispute (client, after delay)'
+              )}
+            </button>
+          )}
+          {freelancerEvidenceSubmitted && (
+            <button
+              className="btn btn-sm btn-secondary"
+              disabled={recoveringArbitration}
+              title="Bounded recovery: only succeeds if resolve_dispute could not reach a valid verdict after the recovery delay has passed since the freelancer submitted evidence."
+              onClick={() =>
+                onRun(
+                  `recover_arb_${deal.id}`,
+                  'Resolve stalled arbitration (recovery)',
+                  (client) =>
+                    writeAndWait(client, {
+                      functionName: 'resolve_stalled_arbitration',
+                      args: [Number(deal.id)],
+                      value: 0n,
+                    }),
+                  { dealId: deal.id, expectedStatuses: ['RESOLVED_FOR_CLIENT'] },
+                )
+              }
+            >
+              {recoveringArbitration ? (
+                <><span className="spinner" /> Recovering...</>
+              ) : (
+                'Resolve stalled arbitration (recovery)'
+              )}
             </button>
           )}
         </div>
@@ -516,7 +607,10 @@ function DealCard({ deal, account, pendingAction, onRun }) {
 
       {freelancerEvidenceSubmitted && (
         <div className="resolve-warning">
-          This can take 1–3 minutes — AI validators are reviewing both sides' evidence.
+          This can take 1–3 minutes — AI validators are reviewing both sides' evidence. If
+          arbitration cannot reach a valid verdict (e.g. evidence pages go offline), the
+          "Resolve stalled arbitration" recovery button becomes available after the recovery
+          delay so funds are never stuck.
         </div>
       )}
     </article>
