@@ -3,9 +3,19 @@ import json
 from genlayer import *
 
 # Minimum blocks that must pass after dispute is raised
-# before the client can cancel a stalled dispute.
+# before the client can cancel a stalled dispute (freelancer never responded).
 # ~50 000 blocks ≈ 7 days at ~12 s/block on Bradbury Testnet.
 DISPUTE_CANCEL_DELAY_BLOCKS = 50_000
+
+# Minimum blocks that must pass after the freelancer submits evidence
+# before anyone can trigger the bounded arbitration-recovery fallback,
+# used when resolve_dispute keeps failing (unreachable evidence pages,
+# an LLM output validators can't agree on, etc.) and the deal would
+# otherwise be stuck in DISPUTED forever.
+# ~20 000 blocks ≈ ~2.8 days at ~12 s/block on Bradbury Testnet.
+ARBITRATION_RECOVERY_DELAY_BLOCKS = 20_000
+
+VALID_WINNERS = ("client", "freelancer")
 
 
 class ArbitrationEscrow(gl.Contract):
@@ -28,6 +38,11 @@ class ArbitrationEscrow(gl.Contract):
                                              -> RESOLVED_FOR_FREELANCER
                -> cancel_stalled_dispute     -> RESOLVED_FOR_CLIENT
                  (client, after delay, only if freelancer never responded)
+               -> resolve_stalled_arbitration -> RESOLVED_FOR_CLIENT
+                 (anyone, after delay, only if both sides submitted evidence
+                  but resolve_dispute never succeeded — e.g. evidence pages
+                  became unreachable or validators could not agree on a
+                  valid verdict)
     """
 
     deals: DynArray[str]
@@ -56,6 +71,7 @@ class ArbitrationEscrow(gl.Contract):
             "freelancer_claim": "",
             "resolution_reasoning": "",
             "dispute_start_block": 0,
+            "freelancer_evidence_block": 0,
         }
         self.deals.append(json.dumps(deal, sort_keys=True))
 
@@ -96,6 +112,7 @@ class ArbitrationEscrow(gl.Contract):
             "Only the freelancer can submit freelancer-side evidence"
         deal["freelancer_evidence_url"] = evidence_url
         deal["freelancer_claim"] = claim
+        deal["freelancer_evidence_block"] = gl.message.block_number
         self.deals[deal_id] = json.dumps(deal, sort_keys=True)
 
     @gl.public.write
@@ -141,8 +158,13 @@ Return ONLY valid JSON in exactly this structure:
             result = gl.nondet.exec_prompt(prompt)
             result = result.replace("```json", "").replace("```", "").strip()
             parsed = json.loads(result)
+            winner = parsed.get("winner")
+            if winner not in VALID_WINNERS:
+                # Reject instead of silently defaulting: an invalid/missing
+                # winner value must never resolve consensus or a payout.
+                raise ValueError(f"Invalid arbitration winner value: {winner!r}")
             normalized = {
-                "winner": parsed.get("winner", "client"),
+                "winner": winner,
                 "reasoning": parsed.get("reasoning", ""),
             }
             return json.dumps(normalized, sort_keys=True)
@@ -152,7 +174,9 @@ Return ONLY valid JSON in exactly this structure:
             principle="The winner field must be exactly the same.",
         )
         parsed_result = json.loads(consensus_result)
-        winner = parsed_result.get("winner", "client")
+        winner = parsed_result.get("winner")
+        assert winner in VALID_WINNERS, \
+            "Arbitration returned an invalid winner value; resolution rejected"
         deal["status"] = (
             "RESOLVED_FOR_FREELANCER" if winner == "freelancer" else "RESOLVED_FOR_CLIENT"
         )
@@ -183,6 +207,37 @@ Return ONLY valid JSON in exactly this structure:
         deal["resolution_reasoning"] = (
             "Freelancer did not submit counter-evidence within the required "
             f"{DISPUTE_CANCEL_DELAY_BLOCKS}-block window. "
+            "Deal resolved in favour of the client by default."
+        )
+        self.deals[deal_id] = json.dumps(deal, sort_keys=True)
+        self._payout(deal["client"], deal["amount"])
+
+    @gl.public.write
+    def resolve_stalled_arbitration(self, deal_id: int) -> None:
+        """
+        Bounded recovery path for a dispute where both sides submitted
+        evidence but resolve_dispute never succeeded (evidence pages
+        became unreachable, or validators could not reach consensus on a
+        valid winner). Anyone may call this once
+        ARBITRATION_RECOVERY_DELAY_BLOCKS have elapsed since the freelancer
+        submitted evidence; it resolves conservatively in favour of the
+        client so the deposit is never permanently stuck.
+        """
+        deal = json.loads(self.deals[deal_id])
+        assert deal["status"] == "DISPUTED", "Deal is not under dispute"
+        assert deal["freelancer_evidence_url"] != "", (
+            "Freelancer has not submitted evidence; use "
+            "cancel_stalled_dispute instead"
+        )
+        blocks_elapsed = gl.message.block_number - deal["freelancer_evidence_block"]
+        assert blocks_elapsed >= ARBITRATION_RECOVERY_DELAY_BLOCKS, (
+            f"Arbitration recovery delay not yet elapsed: {blocks_elapsed} of "
+            f"{ARBITRATION_RECOVERY_DELAY_BLOCKS} blocks have passed"
+        )
+        deal["status"] = "RESOLVED_FOR_CLIENT"
+        deal["resolution_reasoning"] = (
+            "AI arbitration could not reach a valid consensus (evidence "
+            "unreachable or no agreed winner) within the recovery window. "
             "Deal resolved in favour of the client by default."
         )
         self.deals[deal_id] = json.dumps(deal, sort_keys=True)
