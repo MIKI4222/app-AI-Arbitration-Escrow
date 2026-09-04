@@ -8,10 +8,16 @@ These run the contract in-memory (no Docker / Studio required), so they're
 fast enough for CI on every commit.
 """
 import pytest
-from gltest import get_contract_factory, get_default_account, create_account
+from gltest import get_contract_factory, get_default_account, create_account, get_gl_client
 from gltest.assertions import tx_execution_succeeded, tx_execution_failed
 
 ONE_GEN = 10**18
+
+
+def _balance(address: str) -> int:
+    # LocalAccount (eth_account) has no get_balance() — balances are read
+    # through the GenLayer client, not the account object.
+    return get_gl_client().get_balance(address)
 
 
 @pytest.fixture
@@ -67,13 +73,13 @@ def test_release_funds_pays_freelancer_and_updates_status(deployed_contract, fre
         value=ONE_GEN,
     ).transact()
 
-    balance_before = freelancer_account.get_balance()
+    balance_before = _balance(freelancer_account.address)
     receipt = deployed_contract.release_funds(args=[0]).transact()
     assert tx_execution_succeeded(receipt)
 
     deal = deployed_contract.get_deal(args=[0]).call()
     assert deal["status"] == "RELEASED_TO_FREELANCER"
-    assert freelancer_account.get_balance() == balance_before + ONE_GEN
+    assert _balance(freelancer_account.address) == balance_before + ONE_GEN
 
 
 def test_release_funds_rejected_from_non_client(deployed_contract, freelancer_account):
