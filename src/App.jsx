@@ -1,105 +1,147 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
-import { parseEther } from 'viem'
+import { useCallback, useEffect, useRef, useState } from "react";
+import { formatEther, parseEther } from "viem";
 import {
   CONTRACT_ADDRESS,
   connectWallet,
   explorerTxUrl,
   fetchAllDeals,
   fetchTotalDeals,
+  formatDuration,
   hasWallet,
   makeClient,
   makeReadClient,
+  sameAddress,
+  secondsUntilCancelEligible,
+  secondsUntilRecoveryEligible,
   shortenAddress,
-  waitForDealStatus,
+  waitForDealState,
   writeAndWait,
-} from './genlayerClient'
-import './App.css'
+} from "./genlayerClient";
+import "./App.css";
 
 function App() {
-  const [account, setAccount] = useState(null)
-  const [connecting, setConnecting] = useState(false)
-  const [status, setStatus] = useState({ kind: 'info', text: 'Not connected to a wallet.' })
+  const [account, setAccount] = useState(null);
+  const [connecting, setConnecting] = useState(false);
+  const [status, setStatus] = useState({
+    kind: "info",
+    text: "Not connected to a wallet.",
+  });
 
-  const [deals, setDeals] = useState([])
-  const [totalDeals, setTotalDeals] = useState(0)
-  const [loadingDeals, setLoadingDeals] = useState(true)
+  const [deals, setDeals] = useState([]);
+  const [totalDeals, setTotalDeals] = useState(0);
+  const [loadingDeals, setLoadingDeals] = useState(true);
 
-  const [pendingAction, setPendingAction] = useState(null)
-  const [lastTx, setLastTx] = useState(null)
-  const clientRef = useRef(null)
+  const [pendingAction, setPendingAction] = useState(null);
+  const [lastTx, setLastTx] = useState(null);
+  const clientRef = useRef(null);
 
-  const updateStatus = useCallback((kind, text) => setStatus({ kind, text }), [])
+  const updateStatus = useCallback(
+    (kind, text) => setStatus({ kind, text }),
+    [],
+  );
 
-  const refreshDeals = useCallback(async (silent = false) => {
-    if (!silent) setLoadingDeals(true)
-    try {
-      const readClient = makeReadClient()
-      const [list, total] = await Promise.all([
-        fetchAllDeals(readClient),
-        fetchTotalDeals(readClient),
-      ])
-      setDeals(list)
-      setTotalDeals(total)
-      if (!silent) updateStatus('success', `Loaded ${list.length} deal${list.length === 1 ? '' : 's'}.`)
-    } catch (e) {
-      updateStatus('error', `Failed to load deals: ${humanError(e)}`)
-    } finally {
-      setLoadingDeals(false)
-    }
-  }, [updateStatus])
+  const refreshDeals = useCallback(
+    async (silent = false) => {
+      if (!silent) setLoadingDeals(true);
+      try {
+        const readClient = makeReadClient();
+        const [list, total] = await Promise.all([
+          fetchAllDeals(readClient),
+          fetchTotalDeals(readClient),
+        ]);
+        setDeals(list);
+        setTotalDeals(total);
+        if (!silent)
+          updateStatus(
+            "success",
+            `Loaded ${list.length} deal${list.length === 1 ? "" : "s"}.`,
+          );
+      } catch (e) {
+        updateStatus("error", `Failed to load deals: ${humanError(e)}`);
+      } finally {
+        setLoadingDeals(false);
+      }
+    },
+    [updateStatus],
+  );
 
   useEffect(() => {
-    refreshDeals(true)
-  }, [refreshDeals])
+    refreshDeals(true);
+  }, [refreshDeals]);
 
   const handleConnect = useCallback(async () => {
-    setConnecting(true)
+    setConnecting(true);
     try {
-      const addr = await connectWallet()
-      setAccount(addr)
-      clientRef.current = makeClient(addr)
-      updateStatus('success', `Connected as ${shortenAddress(addr)}.`)
+      const addr = await connectWallet();
+      setAccount(addr);
+      clientRef.current = makeClient(addr);
+      updateStatus("success", `Connected as ${shortenAddress(addr)}.`);
     } catch (e) {
-      updateStatus('error', humanError(e))
+      updateStatus("error", humanError(e));
     } finally {
-      setConnecting(false)
+      setConnecting(false);
     }
-  }, [updateStatus])
+  }, [updateStatus]);
 
   const runWrite = useCallback(
-    async (key, label, fn, { dealId, expectedStatuses } = {}) => {
+    async (
+      key,
+      label,
+      fn,
+      { dealId, expectedStatuses, confirm, describe } = {},
+    ) => {
       if (!clientRef.current) {
-        updateStatus('error', 'Connect a wallet first.')
-        return
+        updateStatus("error", "Connect a wallet first.");
+        return;
       }
-      setPendingAction(key)
-      updateStatus('pending', `${label} — waiting for wallet and blockchain consensus...`)
-      setLastTx(null)
+      setPendingAction(key);
+      updateStatus(
+        "pending",
+        `${label} — waiting for wallet and blockchain consensus...`,
+      );
+      setLastTx(null);
       try {
-        const hash = await fn(clientRef.current)
-        setLastTx(hash)
+        const hash = await fn(clientRef.current);
+        setLastTx(hash);
         // writeAndWait already waits for the transaction to be ACCEPTED, but
         // that only confirms execution didn't revert — it doesn't confirm
         // the deal actually reached the status we expect. Poll the real
         // contract state before telling the user it succeeded.
-        if (dealId != null && expectedStatuses) {
-          updateStatus('pending', `${label} — confirming on-chain state...`)
-          await waitForDealStatus(makeReadClient(), dealId, expectedStatuses)
+        if (dealId != null && (confirm || expectedStatuses)) {
+          updateStatus("pending", `${label} — confirming on-chain state...`);
+          const wanted = Array.isArray(expectedStatuses)
+            ? expectedStatuses
+            : expectedStatuses
+              ? [expectedStatuses]
+              : null;
+          const predicate = confirm ?? ((deal) => wanted.includes(deal.status));
+          await waitForDealState(makeReadClient(), dealId, predicate, {
+            describe:
+              describe ??
+              (wanted ? `status ${wanted.join(" or ")}` : "the expected state"),
+          });
         }
-        await refreshDeals(true)
-        updateStatus('success', `${label} succeeded — contract state confirmed.`)
+        await refreshDeals(true);
+        updateStatus(
+          "success",
+          `${label} succeeded — contract state confirmed.`,
+        );
       } catch (e) {
-        updateStatus('error', `${label} failed: ${humanError(e)}`)
+        updateStatus("error", `${label} failed: ${humanError(e)}`);
       } finally {
-        setPendingAction(null)
+        setPendingAction(null);
       }
     },
     [refreshDeals, updateStatus],
-  )
+  );
 
   return (
     <div className="app">
-      <Header account={account} connecting={connecting} onConnect={handleConnect} />
+      <Header
+        account={account}
+        connecting={connecting}
+        onConnect={handleConnect}
+      />
 
       <StatusBar
         status={status}
@@ -110,11 +152,15 @@ function App() {
       <div className="grid-two section">
         <CreateDealCard
           disabled={!account}
-          pending={pendingAction === 'create_deal'}
+          pending={pendingAction === "create_deal"}
           onRun={runWrite}
           nextDealId={totalDeals}
         />
-        <SubmitEvidenceCard disabled={!account} pending={pendingAction === 'submit_evidence'} onRun={runWrite} />
+        <SubmitEvidenceCard
+          disabled={!account}
+          pending={pendingAction === "submit_evidence"}
+          onRun={runWrite}
+        />
       </div>
 
       <DealsSection
@@ -129,7 +175,7 @@ function App() {
 
       <Footer />
     </div>
-  )
+  );
 }
 
 function Header({ account, connecting, onConnect }) {
@@ -139,7 +185,8 @@ function Header({ account, connecting, onConnect }) {
         <h1 className="app-header-title">AI Arbitration Escrow</h1>
         <p className="app-header-subtitle">
           Trust-minimized escrow for client–freelancer agreements. Disputes are
-          resolved by AI validators reaching consensus on the GenLayer blockchain.
+          resolved by AI validators reaching consensus on the GenLayer
+          blockchain.
         </p>
       </div>
       <div className="header-right">
@@ -149,25 +196,29 @@ function Header({ account, connecting, onConnect }) {
             {shortenAddress(account)}
           </span>
         ) : (
-          <button className="btn" onClick={onConnect} disabled={connecting || !hasWallet()}>
+          <button
+            className="btn"
+            onClick={onConnect}
+            disabled={connecting || !hasWallet()}
+          >
             {connecting ? (
               <>
                 <span className="spinner" /> Connecting...
               </>
             ) : !hasWallet() ? (
-              'No wallet detected'
+              "No wallet detected"
             ) : (
-              'Connect Wallet'
+              "Connect Wallet"
             )}
           </button>
         )}
       </div>
     </header>
-  )
+  );
 }
 
 function StatusBar({ status, pendingAction, lastTx }) {
-  const kind = pendingAction ? 'pending' : status.kind
+  const kind = pendingAction ? "pending" : status.kind;
   return (
     <div className="status-bar">
       <div className="status-inner">
@@ -187,42 +238,42 @@ function StatusBar({ status, pendingAction, lastTx }) {
         )}
       </div>
     </div>
-  )
+  );
 }
 
 function CreateDealCard({ disabled, pending, onRun, nextDealId }) {
-  const [freelancer, setFreelancer] = useState('')
-  const [description, setDescription] = useState('')
-  const [amount, setAmount] = useState('')
+  const [freelancer, setFreelancer] = useState("");
+  const [description, setDescription] = useState("");
+  const [amount, setAmount] = useState("");
 
   const canSubmit =
     !disabled &&
     !pending &&
     freelancer.trim().length > 0 &&
     description.trim().length > 0 &&
-    Number(amount) > 0
+    Number(amount) > 0;
 
   const submit = (e) => {
-    e.preventDefault()
+    e.preventDefault();
     // amount is entered in GEN; convert to wei once and use the exact same
     // value both as the deposit sent with the transaction and as the
     // on-chain "amount" the contract records/verifies against it.
-    const amountWei = parseEther(amount)
+    const amountWei = parseEther(amount);
     onRun(
-      'create_deal',
-      'Create deal',
+      "create_deal",
+      "Create deal",
       (client) =>
         writeAndWait(client, {
-          functionName: 'create_deal',
+          functionName: "create_deal",
           args: [freelancer.trim(), description.trim(), amountWei],
           value: amountWei,
         }),
-      { dealId: nextDealId, expectedStatuses: ['FUNDED'] },
-    )
-    setFreelancer('')
-    setDescription('')
-    setAmount('')
-  }
+      { dealId: nextDealId, expectedStatuses: ["FUNDED"] },
+    );
+    setFreelancer("");
+    setDescription("");
+    setAmount("");
+  };
 
   return (
     <section className="card">
@@ -264,37 +315,53 @@ function CreateDealCard({ disabled, pending, onRun, nextDealId }) {
         </div>
         <div className="form-actions">
           <button type="submit" className="btn" disabled={!canSubmit}>
-            {pending ? <><span className="spinner" /> Creating...</> : 'Create Deal'}
+            {pending ? (
+              <>
+                <span className="spinner" /> Creating...
+              </>
+            ) : (
+              "Create Deal"
+            )}
           </button>
-          {disabled && <span className="form-hint">Connect a wallet to create a deal.</span>}
+          {disabled && (
+            <span className="form-hint">
+              Connect a wallet to create a deal.
+            </span>
+          )}
         </div>
       </form>
     </section>
-  )
+  );
 }
 
 function SubmitEvidenceCard({ disabled, pending, onRun }) {
-  const [dealId, setDealId] = useState('')
-  const [role, setRole] = useState('client')
-  const [evidenceUrl, setEvidenceUrl] = useState('')
-  const [claim, setClaim] = useState('')
+  const [dealId, setDealId] = useState("");
+  const [role, setRole] = useState("client");
+  const [evidenceUrl, setEvidenceUrl] = useState("");
+  const [claim, setClaim] = useState("");
 
   const canSubmit =
     !disabled &&
     !pending &&
-    dealId !== '' &&
+    dealId !== "" &&
     evidenceUrl.trim().length > 0 &&
-    claim.trim().length > 0
+    claim.trim().length > 0;
 
   const submit = (e) => {
-    e.preventDefault()
-    const fnName = role === 'client' ? 'submit_client_evidence' : 'submit_freelancer_evidence'
-    const label = role === 'client' ? 'Submit client evidence' : 'Submit freelancer evidence'
+    e.preventDefault();
+    const fnName =
+      role === "client"
+        ? "submit_client_evidence"
+        : "submit_freelancer_evidence";
+    const label =
+      role === "client"
+        ? "Submit client evidence"
+        : "Submit freelancer evidence";
     // Client evidence moves the deal to DISPUTED; freelancer evidence keeps
     // it DISPUTED (but now with both sides in) — either way DISPUTED is the
     // confirmed state we're waiting to observe.
     onRun(
-      'submit_evidence',
+      "submit_evidence",
       label,
       (client) =>
         writeAndWait(client, {
@@ -302,11 +369,25 @@ function SubmitEvidenceCard({ disabled, pending, onRun }) {
           args: [Number(dealId), evidenceUrl.trim(), claim.trim()],
           value: 0n,
         }),
-      { dealId: Number(dealId), expectedStatuses: ['DISPUTED'] },
-    )
-    setEvidenceUrl('')
-    setClaim('')
-  }
+      role === "client"
+        ? {
+            dealId: Number(dealId),
+            expectedStatuses: ["DISPUTED"],
+          }
+        : {
+            dealId: Number(dealId),
+            // Freelancer evidence does not change the status, so confirm the
+            // stored evidence itself instead of reporting a false success.
+            confirm: (deal) =>
+              deal.status === "DISPUTED" &&
+              typeof deal.freelancer_evidence_url === "string" &&
+              deal.freelancer_evidence_url.trim() !== "",
+            describe: "recorded freelancer evidence",
+          },
+    );
+    setEvidenceUrl("");
+    setClaim("");
+  };
 
   return (
     <section className="card">
@@ -332,16 +413,16 @@ function SubmitEvidenceCard({ disabled, pending, onRun }) {
             <div className="role-toggle">
               <button
                 type="button"
-                className={`role-toggle-btn ${role === 'client' ? 'active' : ''}`}
-                onClick={() => setRole('client')}
+                className={`role-toggle-btn ${role === "client" ? "active" : ""}`}
+                onClick={() => setRole("client")}
                 disabled={disabled || pending}
               >
                 Client
               </button>
               <button
                 type="button"
-                className={`role-toggle-btn ${role === 'freelancer' ? 'active' : ''}`}
-                onClick={() => setRole('freelancer')}
+                className={`role-toggle-btn ${role === "freelancer" ? "active" : ""}`}
+                onClick={() => setRole("freelancer")}
                 disabled={disabled || pending}
               >
                 Freelancer
@@ -361,7 +442,9 @@ function SubmitEvidenceCard({ disabled, pending, onRun }) {
           />
         </div>
         <div className="form-field">
-          <label className="form-label">Claim — what does this URL prove?</label>
+          <label className="form-label">
+            Claim — what does this URL prove?
+          </label>
           <textarea
             className="form-textarea"
             placeholder="e.g. This Figma file shows the redesigned landing page delivered on Aug 20."
@@ -372,16 +455,34 @@ function SubmitEvidenceCard({ disabled, pending, onRun }) {
         </div>
         <div className="form-actions">
           <button type="submit" className="btn" disabled={!canSubmit}>
-            {pending ? <><span className="spinner" /> Submitting...</> : 'Submit Evidence'}
+            {pending ? (
+              <>
+                <span className="spinner" /> Submitting...
+              </>
+            ) : (
+              "Submit Evidence"
+            )}
           </button>
-          {disabled && <span className="form-hint">Connect a wallet to submit evidence.</span>}
+          {disabled && (
+            <span className="form-hint">
+              Connect a wallet to submit evidence.
+            </span>
+          )}
         </div>
       </form>
     </section>
-  )
+  );
 }
 
-function DealsSection({ deals, totalDeals, loading, account, pendingAction, onRun, onRefresh }) {
+function DealsSection({
+  deals,
+  totalDeals,
+  loading,
+  account,
+  pendingAction,
+  onRun,
+  onRefresh,
+}) {
   return (
     <section className="section">
       <div className="deals-toolbar">
@@ -389,12 +490,16 @@ function DealsSection({ deals, totalDeals, loading, account, pendingAction, onRu
           <h2 className="section-title">Deals</h2>
           <p className="section-sub">
             {loading
-              ? 'Loading deals from the contract...'
+              ? "Loading deals from the contract..."
               : `${deals.length} shown · ${totalDeals} total on-chain`}
           </p>
         </div>
-        <button className="btn btn-ghost btn-sm" onClick={onRefresh} disabled={loading}>
-          {loading ? <span className="spinner muted" /> : 'Refresh'}
+        <button
+          className="btn btn-ghost btn-sm"
+          onClick={onRefresh}
+          disabled={loading}
+        >
+          {loading ? <span className="spinner muted" /> : "Refresh"}
         </button>
       </div>
 
@@ -422,31 +527,59 @@ function DealsSection({ deals, totalDeals, loading, account, pendingAction, onRu
         </div>
       )}
     </section>
-  )
+  );
 }
 
 function DealCard({ deal, account, pendingAction, onRun }) {
-  const isFunded = deal.status === 'FUNDED'
-  const isDisputed = deal.status === 'DISPUTED'
+  const isFunded = deal.status === "FUNDED";
+  const isDisputed = deal.status === "DISPUTED";
   const freelancerEvidenceSubmitted =
-    isDisputed && deal.freelancer_evidence_url && deal.freelancer_evidence_url.trim() !== ''
-  const resolving = pendingAction === `resolve_${deal.id}`
-  const releasing = pendingAction === `release_${deal.id}`
-  const cancellingStalled = pendingAction === `cancel_stalled_${deal.id}`
-  const recoveringArbitration = pendingAction === `recover_arb_${deal.id}`
-  const disputedNoFreelancerEvidence = isDisputed && !freelancerEvidenceSubmitted
+    isDisputed &&
+    deal.freelancer_evidence_url &&
+    deal.freelancer_evidence_url.trim() !== "";
+  const resolving = pendingAction === `resolve_${deal.id}`;
+  const releasing = pendingAction === `release_${deal.id}`;
+  const cancellingStalled = pendingAction === `cancel_stalled_${deal.id}`;
+  const recoveringArbitration = pendingAction === `recover_arb_${deal.id}`;
+  const disputedNoFreelancerEvidence =
+    isDisputed && !freelancerEvidenceSubmitted;
+  const isClient = sameAddress(account, deal.client);
+  const cancelEta = disputedNoFreelancerEvidence
+    ? secondsUntilCancelEligible(deal)
+    : null;
+  const cancelReady = cancelEta === 0;
+  const recoveryEta = freelancerEvidenceSubmitted
+    ? secondsUntilRecoveryEligible(deal)
+    : null;
+  const recoveryReady = recoveryEta === 0;
+  const amountGen = (() => {
+    try {
+      return formatEther(BigInt(deal.amount ?? 0));
+    } catch {
+      return String(deal.amount ?? "0");
+    }
+  })();
 
   return (
     <article className="deal-card">
       <div className="deal-card-top">
         <div>
           <div className="deal-id">DEAL #{deal.id}</div>
-          <h3 className="deal-desc">{deal.description || 'Untitled deal'}</h3>
+          <h3 className="deal-desc">{deal.description || "Untitled deal"}</h3>
         </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
-          <span className={`status-badge ${deal.status}`}>{prettyStatus(deal.status)}</span>
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 10,
+            flexWrap: "wrap",
+          }}
+        >
+          <span className={`status-badge ${deal.status}`}>
+            {prettyStatus(deal.status)}
+          </span>
           <span className="deal-amount">
-            {deal.amount}
+            {amountGen}
             <span className="unit"> GEN</span>
           </span>
         </div>
@@ -463,40 +596,49 @@ function DealCard({ deal, account, pendingAction, onRun }) {
         </div>
       </div>
 
-      {isDisputed && (deal.client_evidence_url || deal.freelancer_evidence_url) && (
-        <div className="evidence-row">
-          {deal.client_claim && (
-            <div style={{ marginBottom: 6 }}>
-              <span className="ev-label">Client claim:</span>
-              {deal.client_claim}
-            </div>
-          )}
-          {deal.client_evidence_url && (
-            <div style={{ marginBottom: 6 }}>
-              <span className="ev-label">Client evidence:</span>
-              <a href={deal.client_evidence_url} target="_blank" rel="noreferrer">
-                {deal.client_evidence_url}
-              </a>
-            </div>
-          )}
-          {deal.freelancer_claim && (
-            <div style={{ marginBottom: 6 }}>
-              <span className="ev-label">Freelancer claim:</span>
-              {deal.freelancer_claim}
-            </div>
-          )}
-          {deal.freelancer_evidence_url && (
-            <div>
-              <span className="ev-label">Freelancer evidence:</span>
-              <a href={deal.freelancer_evidence_url} target="_blank" rel="noreferrer">
-                {deal.freelancer_evidence_url}
-              </a>
-            </div>
-          )}
-        </div>
-      )}
+      {isDisputed &&
+        (deal.client_evidence_url || deal.freelancer_evidence_url) && (
+          <div className="evidence-row">
+            {deal.client_claim && (
+              <div style={{ marginBottom: 6 }}>
+                <span className="ev-label">Client claim:</span>
+                {deal.client_claim}
+              </div>
+            )}
+            {deal.client_evidence_url && (
+              <div style={{ marginBottom: 6 }}>
+                <span className="ev-label">Client evidence:</span>
+                <a
+                  href={deal.client_evidence_url}
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  {deal.client_evidence_url}
+                </a>
+              </div>
+            )}
+            {deal.freelancer_claim && (
+              <div style={{ marginBottom: 6 }}>
+                <span className="ev-label">Freelancer claim:</span>
+                {deal.freelancer_claim}
+              </div>
+            )}
+            {deal.freelancer_evidence_url && (
+              <div>
+                <span className="ev-label">Freelancer evidence:</span>
+                <a
+                  href={deal.freelancer_evidence_url}
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  {deal.freelancer_evidence_url}
+                </a>
+              </div>
+            )}
+          </div>
+        )}
 
-      {deal.resolution_reasoning && deal.resolution_reasoning.trim() !== '' && (
+      {deal.resolution_reasoning && deal.resolution_reasoning.trim() !== "" && (
         <div className="verdict">
           <div className="verdict-label">AI verdict reasoning</div>
           <p className="verdict-text">{deal.resolution_reasoning}</p>
@@ -512,18 +654,27 @@ function DealCard({ deal, account, pendingAction, onRun }) {
               onClick={() =>
                 onRun(
                   `release_${deal.id}`,
-                  'Release funds',
+                  "Release funds",
                   (client) =>
                     writeAndWait(client, {
-                      functionName: 'release_funds',
+                      functionName: "release_funds",
                       args: [Number(deal.id)],
                       value: 0n,
                     }),
-                  { dealId: deal.id, expectedStatuses: ['RELEASED_TO_FREELANCER'] },
+                  {
+                    dealId: deal.id,
+                    expectedStatuses: ["RELEASED_TO_FREELANCER"],
+                  },
                 )
               }
             >
-              {releasing ? <><span className="spinner" /> Releasing...</> : 'Release funds'}
+              {releasing ? (
+                <>
+                  <span className="spinner" /> Releasing...
+                </>
+              ) : (
+                "Release funds"
+              )}
             </button>
           )}
           {freelancerEvidenceSubmitted && (
@@ -533,72 +684,103 @@ function DealCard({ deal, account, pendingAction, onRun }) {
               onClick={() =>
                 onRun(
                   `resolve_${deal.id}`,
-                  'Resolve dispute (AI arbitration)',
+                  "Resolve dispute (AI arbitration)",
                   (client) =>
                     writeAndWait(client, {
-                      functionName: 'resolve_dispute',
+                      functionName: "resolve_dispute",
                       args: [Number(deal.id)],
                       value: 0n,
                     }),
                   {
                     dealId: deal.id,
-                    expectedStatuses: ['RESOLVED_FOR_CLIENT', 'RESOLVED_FOR_FREELANCER'],
+                    expectedStatuses: [
+                      "RESOLVED_FOR_CLIENT",
+                      "RESOLVED_FOR_FREELANCER",
+                    ],
                   },
                 )
               }
             >
-              {resolving ? <><span className="spinner" /> Resolving...</> : 'Resolve dispute'}
+              {resolving ? (
+                <>
+                  <span className="spinner" /> Resolving...
+                </>
+              ) : (
+                "Resolve dispute"
+              )}
             </button>
           )}
-          {disputedNoFreelancerEvidence && (
+          {disputedNoFreelancerEvidence && isClient && (
             <button
               className="btn btn-sm btn-secondary"
-              disabled={cancellingStalled}
-              title={`Only callable by the client once ${'50 000'} blocks have passed since the dispute was opened and the freelancer never responded.`}
+              disabled={cancellingStalled || !cancelReady}
+              title={
+                cancelReady
+                  ? "The freelancer never responded and the 7-day window has passed — you can cancel and take the deposit back."
+                  : `Available in ${formatDuration(cancelEta)} (7 days after the dispute was opened, only while the freelancer has not responded).`
+              }
               onClick={() =>
                 onRun(
                   `cancel_stalled_${deal.id}`,
-                  'Cancel stalled dispute',
+                  "Cancel stalled dispute",
                   (client) =>
                     writeAndWait(client, {
-                      functionName: 'cancel_stalled_dispute',
+                      functionName: "cancel_stalled_dispute",
                       args: [Number(deal.id)],
                       value: 0n,
                     }),
-                  { dealId: deal.id, expectedStatuses: ['RESOLVED_FOR_CLIENT'] },
+                  {
+                    dealId: deal.id,
+                    expectedStatuses: ["RESOLVED_FOR_CLIENT"],
+                  },
                 )
               }
             >
               {cancellingStalled ? (
-                <><span className="spinner" /> Cancelling...</>
+                <>
+                  <span className="spinner" /> Cancelling...
+                </>
+              ) : cancelReady ? (
+                "Cancel stalled dispute — refund me"
               ) : (
-                'Cancel stalled dispute (client, after delay)'
+                `Cancel stalled dispute (in ${formatDuration(cancelEta)})`
               )}
             </button>
           )}
           {freelancerEvidenceSubmitted && (
             <button
               className="btn btn-sm btn-secondary"
-              disabled={recoveringArbitration}
-              title="Bounded recovery: only succeeds if resolve_dispute could not reach a valid verdict after the recovery delay has passed since the freelancer submitted evidence."
+              disabled={recoveringArbitration || !recoveryReady}
+              title={
+                recoveryReady
+                  ? "Bounded recovery: arbitration never produced a valid verdict, so the deposit returns to the client."
+                  : `Available in ${formatDuration(recoveryEta)} — only needed if AI arbitration cannot reach a valid verdict.`
+              }
               onClick={() =>
                 onRun(
                   `recover_arb_${deal.id}`,
-                  'Resolve stalled arbitration (recovery)',
+                  "Resolve stalled arbitration (recovery)",
                   (client) =>
                     writeAndWait(client, {
-                      functionName: 'resolve_stalled_arbitration',
+                      functionName: "resolve_stalled_arbitration",
                       args: [Number(deal.id)],
                       value: 0n,
                     }),
-                  { dealId: deal.id, expectedStatuses: ['RESOLVED_FOR_CLIENT'] },
+                  {
+                    dealId: deal.id,
+                    expectedStatuses: ["RESOLVED_FOR_CLIENT"],
+                  },
                 )
               }
             >
               {recoveringArbitration ? (
-                <><span className="spinner" /> Recovering...</>
+                <>
+                  <span className="spinner" /> Recovering...
+                </>
+              ) : recoveryReady ? (
+                "Resolve stalled arbitration (recovery)"
               ) : (
-                'Resolve stalled arbitration (recovery)'
+                `Recovery available in ${formatDuration(recoveryEta)}`
               )}
             </button>
           )}
@@ -607,14 +789,14 @@ function DealCard({ deal, account, pendingAction, onRun }) {
 
       {freelancerEvidenceSubmitted && (
         <div className="resolve-warning">
-          This can take 1–3 minutes — AI validators are reviewing both sides' evidence. If
-          arbitration cannot reach a valid verdict (e.g. evidence pages go offline), the
-          "Resolve stalled arbitration" recovery button becomes available after the recovery
-          delay so funds are never stuck.
+          This can take 1–3 minutes — AI validators are reviewing both sides'
+          evidence. If arbitration cannot reach a valid verdict (e.g. evidence
+          pages go offline), the "Resolve stalled arbitration" recovery button
+          becomes available after the recovery delay so funds are never stuck.
         </div>
       )}
     </article>
-  )
+  );
 }
 
 function Footer() {
@@ -622,24 +804,29 @@ function Footer() {
     <footer className="app-footer">
       <span>AI Arbitration Escrow · built on GenLayer</span>
       <span className="footer-chain">
-        <a href="https://github.com/MIKI4222/ai-arbitration-escrow" target="_blank" rel="noreferrer">
+        <a
+          href="https://github.com/MIKI4222/ai-arbitration-escrow"
+          target="_blank"
+          rel="noreferrer"
+        >
           GitHub repository ↗
         </a>
       </span>
     </footer>
-  )
+  );
 }
 
 function prettyStatus(s) {
-  return (s || '').replace(/_/g, ' ')
+  return (s || "").replace(/_/g, " ");
 }
 
 function humanError(e) {
-  if (!e) return 'Unknown error'
-  const msg = e?.shortMessage || e?.message || String(e)
-  if (/user rejected/i.test(msg)) return 'Transaction rejected in wallet.'
-  if (/not installed/i.test(msg)) return 'No wallet detected. Install OKX Wallet, MetaMask, or Rabby.'
-  return msg
+  if (!e) return "Unknown error";
+  const msg = e?.shortMessage || e?.message || String(e);
+  if (/user rejected/i.test(msg)) return "Transaction rejected in wallet.";
+  if (/not installed/i.test(msg))
+    return "No wallet detected. Install OKX Wallet, MetaMask, or Rabby.";
+  return msg;
 }
 
-export default App
+export default App;
